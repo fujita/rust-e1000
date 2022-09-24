@@ -11,6 +11,7 @@ use kernel::c_str;
 use kernel::device;
 use kernel::dma;
 use kernel::driver;
+use kernel::endian::{le32, le64};
 use kernel::irq;
 use kernel::net;
 use kernel::pci;
@@ -100,8 +101,8 @@ impl Ring {
         let mut size = DEFAULT_TXD * desc_size;
         size = (size + 4096 - 1) & !(4096 - 1);
         let mut dma_addr = 0;
-        let desc = dma::alloc_coherent(dev, size as usize, &mut dma_addr, bindings::GFP_KERNEL)
-            .unwrap();
+        let desc =
+            dma::alloc_coherent(dev, size as usize, &mut dma_addr, bindings::GFP_KERNEL).unwrap();
         Ring {
             buffer_info: [Buffer {
                 skb: None,
@@ -250,10 +251,10 @@ impl DeviceOperations for E1000 {
             bindings::netdev_sent_queue(netdev, (*skb).len);
 
             let desc = tx_ring.desc.add(i * core::mem::size_of::<TxDesc>()) as *mut TxDesc;
-            (*desc).buffer_addr = dma;
-            (*desc).lower.data = E1000_TXD_CMD_IFCS | size as u32;
-            (*desc).upper.data = 0;
-            (*desc).lower.data |= E1000_TXD_CMD_EOP | E1000_TXD_CMD_IFCS | E1000_TXD_CMD_RS;
+            (*desc).buffer_addr = le64::from(dma);
+            (*desc).upper.data = le32::from(0);
+            (*desc).lower.data =
+                le32::from(size as u32 | E1000_TXD_CMD_EOP | E1000_TXD_CMD_IFCS | E1000_TXD_CMD_RS);
 
             i += 1;
             if i == DEFAULT_TXD {
@@ -337,7 +338,7 @@ impl E1000 {
         unsafe {
             let mut desc = tx_ring.desc.add(i * core::mem::size_of::<TxDesc>()) as *mut TxDesc;
 
-            while (*desc).upper.data & E1000_TXD_STAT_DD != 0 {
+            while u32::from((*desc).upper.data) & E1000_TXD_STAT_DD != 0 {
                 let mut info = &mut tx_ring.buffer_info[i];
 
                 dma::unmap_single(
@@ -348,7 +349,7 @@ impl E1000 {
                 );
                 info.dma = 0;
                 let skb = info.skb.take().unwrap();
-                (*desc).upper.data = 0;
+                (*desc).upper.data = le32::from(0);
                 pkts_compl += 1;
                 bytes_compl += (*skb).len;
 
@@ -383,7 +384,7 @@ impl E1000 {
         unsafe {
             let mut desc = rx_ring.desc.add(i * core::mem::size_of::<RxDesc>()) as *mut RxDesc;
             while (*desc).status & E1000_RXD_STAT_DD as u8 != 0 {
-                let mut length = (*desc).length;
+                let mut length = u16::from((*desc).length);
                 let mut info = &mut rx_ring.buffer_info[i];
 
                 dma::unmap_single(
@@ -400,7 +401,7 @@ impl E1000 {
                 bindings::skb_set_protocol(skb, bindings::eth_type_trans(skb, (*napi).dev));
                 bindings::napi_gro_receive(napi, skb);
                 (*desc).status = 0;
-                (*desc).buffer_addr = 0;
+                (*desc).buffer_addr = le64::from(0);
 
                 pkts_compl += 1;
                 bytes_compl += length;
@@ -517,7 +518,7 @@ impl E1000 {
                 );
                 assert!(dma != !0);
                 let desc = ring.desc.add(i * core::mem::size_of::<RxDesc>()) as *mut RxDesc;
-                (*desc).buffer_addr = dma;
+                (*desc).buffer_addr = le64::from(dma);
                 info.dma = dma;
                 info.skb.replace(skb);
             }

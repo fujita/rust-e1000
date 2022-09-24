@@ -1,15 +1,17 @@
+use kernel::endian::{le16, le32, le64};
+
 // FIXME: handle endian
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct DescFlags {
-    pub(crate) length: u16,
+    pub(crate) length: le16,
     pub(crate) cso: u8,
     pub(crate) cmd: u8,
 }
 
 #[repr(C)]
 pub(crate) union TxLower {
-    pub(crate) data: u32,
+    pub(crate) data: le32,
     pub(crate) flags: DescFlags,
 }
 
@@ -18,30 +20,30 @@ pub(crate) union TxLower {
 pub(crate) struct DescFields {
     pub(crate) status: u8,
     pub(crate) css: u8,
-    pub(crate) special: u16,
+    pub(crate) special: le16,
 }
 
 #[repr(C)]
 pub(crate) union TxUpper {
-    pub(crate) data: u32,
+    pub(crate) data: le32,
     pub(crate) fields: DescFields,
 }
 
 #[repr(C)]
 pub(crate) struct TxDesc {
-    pub(crate) buffer_addr: u64,
+    pub(crate) buffer_addr: le64,
     pub(crate) lower: TxLower,
     pub(crate) upper: TxUpper,
 }
 
 #[repr(C)]
 pub(crate) struct RxDesc {
-    pub(crate) buffer_addr: u64, /* Address of the descriptor's data buffer */
-    pub(crate) length: u16,      /* Length of data DMAed into data buffer */
-    pub(crate) csum: u16,        /* Packet checksum */
-    pub(crate) status: u8,       /* Descriptor status */
-    pub(crate) errors: u8,       /* Descriptor Errors */
-    pub(crate) special: u16,
+    pub(crate) buffer_addr: le64, /* Address of the descriptor's data buffer */
+    pub(crate) length: le16,      /* Length of data DMAed into data buffer */
+    pub(crate) csum: le16,        /* Packet checksum */
+    pub(crate) status: u8,        /* Descriptor status */
+    pub(crate) errors: u8,        /* Descriptor Errors */
+    pub(crate) special: le16,
 }
 
 pub(crate) const E1000_IMS_ENABLE_MASK: u32 =
