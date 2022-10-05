@@ -2,50 +2,30 @@
 
 //! Rust simple Intel e1000 driver (works on only QEMU)
 
-#![allow(dead_code)]
-
-use core::cell::UnsafeCell;
 use core::ffi::c_void;
+use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use core::time::Duration;
 use kernel::bindings;
 use kernel::c_str;
+use kernel::delay;
 use kernel::device;
 use kernel::dma;
 use kernel::driver;
+use kernel::error::code::EINVAL;
 use kernel::irq;
 use kernel::net;
 use kernel::pci;
 use kernel::prelude::*;
-use kernel::sync::{Ref, UniqueRef};
+use kernel::spinlock_init;
+use kernel::sync;
+use kernel::sync::{Arc, SpinLock};
 
 mod e1000_defs;
 use e1000_defs::*;
 
-mod ops;
-use ops::*;
-
-struct Napi {
-    inner: UnsafeCell<bindings::napi_struct>,
-}
-
-impl Napi {
-    fn enable(&self) {
-        unsafe {
-            bindings::napi_enable(self.inner.get());
-        }
-    }
-
-    fn schedule(&self) {
-        unsafe {
-            if bindings::napi_schedule_prep(self.inner.get()) {
-                bindings::__napi_schedule(self.inner.get())
-            }
-        }
-    }
-}
-
 struct Resource {
     mmio: pci::MappedResource,
-    io_base: u64,
+    port: pci::IoPort,
 }
 
 impl Resource {
@@ -62,10 +42,8 @@ impl Resource {
     }
 
     fn write_reg_io(&self, offset: u32, value: u32) {
-        unsafe {
-            bindings::outl(offset, self.io_base);
-            bindings::outl(value, self.io_base + 4);
-        }
+        let _ = self.port.outl(offset, 0);
+        let _ = self.port.outl(value, 4);
     }
 
     fn write_reg_array(&self, reg: u32, offset: u32, value: u32) {
@@ -75,52 +53,38 @@ impl Resource {
     }
 }
 
-#[derive(Clone, Copy)]
 struct Buffer {
-    skb: Option<*mut bindings::sk_buff>,
-    dma: u64,
-    length: usize,
+    skb: Option<ARef<net::SkBuff>>,
+    map: Option<dma::MapSingle<c_void>>,
 }
 
 const DEFAULT_TXD: usize = 128;
 const RXBUFFER_2048: u32 = 2048;
 
-struct Ring {
+struct Ring<T> {
     buffer_info: [Buffer; DEFAULT_TXD],
-    desc: *mut c_void,
-    dma_addr: u64,
-    head_offset: usize,
-    tail_offset: usize,
-    next_to_use: u16,
-    next_to_clean: u16,
+    alloc: dma::Allocation<T>,
+    next_to_use: usize,
+    next_to_clean: usize,
 }
 
-impl Ring {
-    fn new(dev: &device::Device, desc_size: usize) -> Ring {
-        let mut size = DEFAULT_TXD * desc_size;
-        size = (size + 4096 - 1) & !(4096 - 1);
-        let mut dma_addr = 0;
-        let desc = dma::alloc_coherent(dev, size as usize, &mut dma_addr, bindings::GFP_KERNEL)
-            .unwrap();
-        Ring {
-            buffer_info: [Buffer {
-                skb: None,
-                dma: 0,
-                length: 0,
-            }; DEFAULT_TXD],
-            desc,
-            dma_addr,
-            head_offset: 0,
-            tail_offset: 0,
+impl<T> Ring<T> {
+    fn new(dev: &device::Device, count: usize) -> Box<Ring<T>> {
+        let alloc = dma::Allocation::<T>::try_new(dev, count, bindings::GFP_KERNEL).unwrap();
+
+        Box::try_new(Ring {
+            buffer_info: unsafe { core::mem::zeroed() },
+            alloc,
             next_to_use: 0,
             next_to_clean: 0,
-        }
+        })
+        .unwrap()
     }
 }
 
 struct IntrData {
-    re: Ref<Resource>,
-    napi: Ref<Napi>,
+    re: Arc<Resource>,
+    napi: Arc<net::Napi>,
 }
 
 impl irq::Handler for E1000 {
@@ -137,38 +101,60 @@ impl irq::Handler for E1000 {
     }
 }
 
-/// per device Data
-struct DevData {
-    dev: Ref<device::Device>,
-    re: Ref<Resource>,
-    irqnum: u32,
-    tx_ring: Option<Ring>,
-    rx_ring: Option<Ring>,
-    napi: Ref<Napi>,
-    _irq: Option<irq::Registration<E1000>>,
+struct Stats {
+    rx_bytes: AtomicU64,
+    rx_packets: AtomicU64,
+    tx_bytes: AtomicU64,
+    tx_packets: AtomicU64,
 }
 
-const E1000_TX_FLAGS_IPV4: u32 = 0x00000008;
+impl Stats {
+    fn new() -> Self {
+        Stats {
+            rx_bytes: AtomicU64::new(0),
+            rx_packets: AtomicU64::new(0),
+            tx_bytes: AtomicU64::new(0),
+            tx_packets: AtomicU64::new(0),
+        }
+    }
+}
 
-impl DeviceOperations for E1000 {
-    fn open(netdev: *mut bindings::net_device) -> i32 {
-        let mut devdata: Box<DevData> =
-            unsafe { Box::from_raw(bindings::dev_get_drvdata(&mut (*netdev).dev) as _) };
+/// per device Data
+struct DevData {
+    dev: Arc<device::Device>,
+    re: Arc<Resource>,
+    irqnum: u32,
+    tx_ring: Pin<Box<SpinLock<Box<Ring<TxDesc>>>>>,
+    rx_ring: Pin<Box<SpinLock<Box<Ring<RxDesc>>>>>,
+    stats: Stats,
+    napi: Arc<net::Napi>,
+    _irq: AtomicPtr<irq::Registration<E1000>>,
+}
 
-        let mut tx_ring = Ring::new(&devdata.dev, core::mem::size_of::<TxDesc>());
-        let mut rx_ring = Ring::new(&devdata.dev, core::mem::size_of::<RxDesc>());
+unsafe impl Send for DevData {}
+
+unsafe impl Sync for DevData {}
+
+// const E1000_TX_FLAGS_IPV4: u32 = 0x00000008;
+
+#[vtable]
+impl net::DeviceOperations for E1000 {
+    type Data = Box<DevData>;
+
+    fn open(netdev: &net::Device, devdata: &DevData) -> Result {
         E1000::power_up_phy(&devdata.re);
 
-        E1000::configure(
-            netdev,
-            &devdata.dev,
-            &devdata.re,
-            &mut tx_ring,
-            &mut rx_ring,
-        );
-
-        devdata.tx_ring.replace(tx_ring);
-        devdata.rx_ring.replace(rx_ring);
+        {
+            let mut tx_ring = devdata.tx_ring.lock();
+            let mut rx_ring = devdata.rx_ring.lock();
+            E1000::configure(
+                netdev,
+                &devdata.dev,
+                &devdata.re,
+                &mut tx_ring,
+                &mut rx_ring,
+            );
+        }
 
         let intrdata = Box::try_new(IntrData {
             re: devdata.re.clone(),
@@ -181,110 +167,105 @@ impl DeviceOperations for E1000 {
         let irq =
             irq::Registration::try_new(devdata.irqnum, intrdata, irq::flags::SHARED, fmt!("e1000"))
                 .unwrap();
-        devdata._irq.replace(irq);
+        devdata
+            ._irq
+            .store(Box::into_raw(Box::try_new(irq).unwrap()), Ordering::Relaxed);
 
-        E1000::irq_enable(&devdata.re);
-        unsafe {
-            bindings::netif_start_queue(netdev);
-        }
+        let re = &devdata.re;
+        E1000::irq_enable(re);
+        netdev.netif_start_queue();
 
         /* fire a link status change interrupt to start the watchdog */
-        devdata.re.ew32(E1000_ICS, E1000_ICS_LSC);
+        re.ew32(E1000_ICS, E1000_ICS_LSC);
 
-        // HACK; should do watchdog handler
-        unsafe {
-            bindings::netif_carrier_on(netdev);
-            let mut tctl = devdata.re.er32(E1000_TCTL);
+        // FIXME: should do watchdog handler
+        {
+            netdev.netif_carrier_on();
+            let mut tctl = re.er32(E1000_TCTL);
             tctl |= E1000_TCTL_EN;
-            devdata.re.ew32(E1000_TCTL, tctl);
-
-            let rctl = devdata.re.er32(E1000_RCTL);
-            devdata.re.ew32(E1000_RCTL, rctl | E1000_RCTL_EN);
-            devdata.re.ew32(E1000_ICS, E1000_ICS_RXDMT0);
+            re.ew32(E1000_TCTL, tctl);
+            let rctl = re.er32(E1000_RCTL);
+            re.ew32(E1000_RCTL, rctl | E1000_RCTL_EN);
+            re.ew32(E1000_ICS, E1000_ICS_RXDMT0);
         }
 
-        unsafe {
-            bindings::dev_set_drvdata(
-                &mut (*netdev).dev,
-                Box::into_raw(devdata) as *const _ as *mut c_void,
-            );
-        }
-        0
+        Ok(())
     }
 
-    fn xmit(skb: *mut bindings::sk_buff, netdev: *mut bindings::net_device) -> i32 {
-        let mut devdata: Box<DevData> =
-            unsafe { Box::from_raw(bindings::dev_get_drvdata(&mut (*netdev).dev) as _) };
+    fn start_xmit(skb: &net::SkBuff, netdev: &net::Device, devdata: &DevData) -> net::NetdevTx {
+        let mut tx_ring = devdata.tx_ring.lock();
+        let mut _tx_flags = 0;
 
-        unsafe {
-            let mut tx_ring = &mut devdata.tx_ring.as_mut().unwrap();
-            let mut _tx_flags = 0;
-            bindings::skb_put_padto(skb, bindings::ETH_ZLEN);
-            let mss = (*bindings::skb_shinfo(skb)).gso_size;
-            assert!(mss == 0);
+        skb.put_padto(bindings::ETH_ZLEN);
+        // let mss = (*bindings::skb_shinfo(skb)).gso_size;
+        // assert!(mss == 0);
 
-            let nr_frags = (*bindings::skb_shinfo(skb)).nr_frags;
-            assert!(nr_frags == 0);
+        // let nr_frags = (*bindings::skb_shinfo(skb)).nr_frags;
+        // assert!(nr_frags == 0);
 
-            if bindings::vlan_get_protocol(skb) == 0x0008 {
-                _tx_flags |= E1000_TX_FLAGS_IPV4;
-            }
+        // if bindings::vlan_get_protocol(skb) == 0x0008 {
+        //     _tx_flags |= E1000_TX_FLAGS_IPV4;
+        // }
 
-            let mut i = tx_ring.next_to_use as usize;
-            let size = (*skb).len - (*skb).data_len;
-            let dev = &devdata.dev;
-            let info = &mut tx_ring.buffer_info[i];
+        let mut i = tx_ring.next_to_use;
 
-            let dma = dma::map_single(
-                dev,
-                (*skb).data as _,
-                size as usize,
-                bindings::dma_data_direction_DMA_TO_DEVICE,
-            );
-            assert!(dma != !0);
+        let size = skb.len() - skb.data_len();
+        let dev = &devdata.dev;
+        let info = &mut tx_ring.buffer_info[i];
 
-            info.skb = Some(skb);
-            info.dma = dma;
-            info.length = size as usize;
+        let map = dma::MapSingle::try_new(
+            dev.as_ref(),
+            skb.head_data().as_ptr() as _,
+            size as usize,
+            bindings::dma_data_direction_DMA_TO_DEVICE,
+        )
+        .unwrap();
 
-            bindings::netdev_sent_queue(netdev, (*skb).len);
+        let dma_handle = map.dma_handle;
+        info.skb = Some(skb.into());
+        info.map = Some(map);
 
-            let desc = tx_ring.desc.add(i * core::mem::size_of::<TxDesc>()) as *mut TxDesc;
-            (*desc).buffer_addr = dma;
-            (*desc).lower.data = E1000_TXD_CMD_IFCS | size as u32;
-            (*desc).upper.data = 0;
-            (*desc).lower.data |= E1000_TXD_CMD_EOP | E1000_TXD_CMD_IFCS | E1000_TXD_CMD_RS;
+        netdev.sent_queue(skb.len());
 
-            i += 1;
-            if i == DEFAULT_TXD {
-                i = 0;
-            }
-            tx_ring.next_to_use = i as u16;
-            devdata.re.ew32(E1000_TDT, i as u32);
+        let desc = TxDesc {
+            buffer_addr: dma_handle,
+            lower: TxLower {
+                data: E1000_TXD_CMD_EOP | E1000_TXD_CMD_IFCS | E1000_TXD_CMD_RS | size as u32,
+            },
+            upper: TxUpper { data: 0 },
+        };
+        tx_ring.alloc.write(i, &desc).unwrap();
+
+        i += 1;
+        if i == DEFAULT_TXD {
+            i = 0;
         }
+        tx_ring.next_to_use = i;
+        devdata.re.ew32(E1000_TDT, i as u32);
 
-        unsafe {
-            bindings::dev_set_drvdata(
-                &mut (*netdev).dev,
-                Box::into_raw(devdata) as *const _ as *mut c_void,
-            );
-        }
-
-        0
+        net::NetdevTx::Ok
     }
 
-    fn set_rx_mode(netdev: *mut bindings::net_device) {
-        let devdata: Box<DevData> =
-            unsafe { Box::from_raw(bindings::dev_get_drvdata(&mut (*netdev).dev) as _) };
+    fn stop(_netdev: &net::Device, _data: &DevData) -> Result {
+        // FIXME: not implemented yet
+        Ok(())
+    }
 
-        E1000::set_rx_mode(netdev, &devdata.re);
+    fn get_stats64(_netdev: &net::Device, data: &DevData, stats: &mut net::RtnlLinkStats64) {
+        stats.set_rx_bytes(data.stats.rx_bytes.load(Ordering::Relaxed));
+        stats.set_rx_packets(data.stats.rx_packets.load(Ordering::Relaxed));
+        stats.set_tx_bytes(data.stats.tx_bytes.load(Ordering::Relaxed));
+        stats.set_tx_packets(data.stats.tx_packets.load(Ordering::Relaxed));
+    }
+}
 
-        unsafe {
-            bindings::dev_set_drvdata(
-                &mut (*netdev).dev,
-                Box::into_raw(devdata) as *const _ as *mut c_void,
-            );
-        }
+struct Poller;
+
+impl net::NapiPoller for Poller {
+    type Data = Box<DevData>;
+
+    fn poll(napi: &net::Napi, budget: i32, _dev: &net::Device, data: &DevData) -> i32 {
+        E1000::clean(napi, budget, data)
     }
 }
 
@@ -296,135 +277,122 @@ struct EepromInfo {
 }
 
 impl E1000 {
-    unsafe extern "C" fn clean(napi: *mut bindings::napi_struct, _budget: i32) -> i32 {
-        let mut devdata: Box<DevData> =
-            unsafe { Box::from_raw(bindings::dev_get_drvdata(&mut (*(*napi).dev).dev) as _) };
-
+    fn clean(napi: &net::Napi, _budget: i32, devdata: &DevData) -> i32 {
         {
-            let cleaned_count =
-                E1000::clean_rx_irq(&devdata.dev, napi, &mut devdata.rx_ring.as_mut().unwrap());
-            unsafe {
-                E1000::alloc_rx_buffers(
-                    (*napi).dev,
-                    &devdata.dev,
-                    &devdata.re,
-                    &mut devdata.rx_ring.as_mut().unwrap(),
-                    cleaned_count as u16,
-                );
-            }
-            E1000::clean_tx_irq(&devdata.dev, napi, &mut devdata.tx_ring.as_mut().unwrap());
-        }
-
-        unsafe {
-            bindings::napi_complete_done(napi, 1);
-        }
-
-        unsafe {
-            bindings::dev_set_drvdata(
-                &mut (*(*napi).dev).dev,
-                Box::into_raw(devdata) as *const _ as *mut c_void,
+            let mut rx_ring = devdata.rx_ring.lock();
+            let cleaned_count = E1000::clean_rx_irq(napi, &mut rx_ring, devdata);
+            E1000::alloc_rx_buffers(
+                &napi.dev_get(),
+                &devdata.dev,
+                &devdata.re,
+                &mut rx_ring,
+                cleaned_count,
             );
         }
+        {
+            let mut tx_ring = devdata.tx_ring.lock();
+            E1000::clean_tx_irq(napi, &mut tx_ring, devdata);
+        }
+
+        napi.complete_done(1);
 
         1
     }
 
-    fn clean_tx_irq(dev: &device::Device, napi: *mut bindings::napi_struct, tx_ring: &mut Ring) {
-        let mut i = tx_ring.next_to_clean as usize;
+    fn clean_tx_irq(napi: &net::Napi, tx_ring: &mut Ring<TxDesc>, devdata: &DevData) {
+        let mut i = tx_ring.next_to_clean;
         let mut pkts_compl = 0;
         let mut bytes_compl = 0;
 
-        unsafe {
-            let mut desc = tx_ring.desc.add(i * core::mem::size_of::<TxDesc>()) as *mut TxDesc;
+        let mut desc = tx_ring.alloc.read_volatile(i).unwrap();
 
-            while (*desc).upper.data & E1000_TXD_STAT_DD != 0 {
-                let mut info = &mut tx_ring.buffer_info[i];
+        while unsafe { desc.upper.data & E1000_TXD_STAT_DD != 0 } {
+            let info = &mut tx_ring.buffer_info[i];
 
-                dma::unmap_single(
-                    dev,
-                    info.dma,
-                    info.length,
-                    bindings::dma_data_direction_DMA_TO_DEVICE,
-                );
-                info.dma = 0;
-                let skb = info.skb.take().unwrap();
-                (*desc).upper.data = 0;
-                pkts_compl += 1;
-                bytes_compl += (*skb).len;
+            let _ = info.map.take();
+            let skb = info.skb.take().unwrap();
+            let mut d = desc;
+            d.upper.data = 0;
+            tx_ring.alloc.write(i, &d).unwrap();
 
-                bindings::napi_consume_skb(skb, 64);
+            pkts_compl += 1;
+            bytes_compl += skb.len();
 
-                i += 1;
-                if i == DEFAULT_TXD {
-                    i = 0;
-                }
-                desc = tx_ring.desc.add(i * core::mem::size_of::<TxDesc>()) as *mut TxDesc;
+            skb.napi_consume(64);
+
+            i += 1;
+            if i == DEFAULT_TXD {
+                i = 0;
             }
-
-            (*(*napi).dev).stats.tx_bytes += bytes_compl as u64;
-            (*(*napi).dev).stats.tx_packets += pkts_compl as u64;
+            desc = tx_ring.alloc.read_volatile(i).unwrap();
         }
-        tx_ring.next_to_clean = i as u16;
 
-        unsafe {
-            bindings::netdev_completed_queue((*napi).dev, pkts_compl, bytes_compl);
-        }
+        devdata
+            .stats
+            .tx_bytes
+            .fetch_add(bytes_compl as u64, Ordering::Relaxed);
+        devdata
+            .stats
+            .tx_packets
+            .fetch_add(pkts_compl as u64, Ordering::Relaxed);
+
+        tx_ring.next_to_clean = i;
+
+        napi.dev_get().completed_queue(pkts_compl, bytes_compl);
     }
 
-    fn clean_rx_irq(
-        dev: &device::Device,
-        napi: *mut bindings::napi_struct,
-        rx_ring: &mut Ring,
-    ) -> usize {
-        let mut i = rx_ring.next_to_clean as usize;
+    fn clean_rx_irq(napi: &net::Napi, rx_ring: &mut Ring<RxDesc>, devdata: &DevData) -> usize {
+        let mut i = rx_ring.next_to_clean;
         let mut pkts_compl = 0;
         let mut bytes_compl = 0;
 
-        unsafe {
-            let mut desc = rx_ring.desc.add(i * core::mem::size_of::<RxDesc>()) as *mut RxDesc;
-            while (*desc).status & E1000_RXD_STAT_DD as u8 != 0 {
-                let mut length = (*desc).length;
-                let mut info = &mut rx_ring.buffer_info[i];
+        let mut desc = rx_ring.alloc.read_volatile(i).unwrap();
+        while desc.status & E1000_RXD_STAT_DD as u8 != 0 {
+            let mut length = desc.length;
+            let info = &mut rx_ring.buffer_info[i];
 
-                dma::unmap_single(
-                    dev,
-                    info.dma,
-                    RXBUFFER_2048 as usize,
-                    bindings::dma_data_direction_DMA_FROM_DEVICE,
-                );
-                info.dma = 0;
-                let skb = info.skb.take().unwrap();
+            let _ = info.map.take();
+            let skb = info.skb.take().unwrap();
 
-                length -= 4;
-                bindings::skb_put(skb, length as u32);
-                bindings::skb_set_protocol(skb, bindings::eth_type_trans(skb, (*napi).dev));
-                bindings::napi_gro_receive(napi, skb);
-                (*desc).status = 0;
-                (*desc).buffer_addr = 0;
+            length -= 4;
+            skb.put(length as u32);
+            let protocol = skb.eth_type_trans(&napi.dev_get());
+            skb.protocol_set(protocol);
+            napi.gro_receive(&skb);
+            let mut d = desc;
+            d.status = 0;
+            d.buffer_addr = 0;
+            rx_ring.alloc.write(i, &d).unwrap();
 
-                pkts_compl += 1;
-                bytes_compl += length;
+            pkts_compl += 1;
+            bytes_compl += length;
 
-                i += 1;
-                if i == DEFAULT_TXD {
-                    i = 0;
-                }
-                desc = rx_ring.desc.add(i * core::mem::size_of::<RxDesc>()) as *mut RxDesc;
+            i += 1;
+            if i == DEFAULT_TXD {
+                i = 0;
             }
-
-            (*(*napi).dev).stats.rx_bytes += bytes_compl as u64;
-            (*(*napi).dev).stats.rx_packets += pkts_compl as u64;
+            desc = rx_ring.alloc.read_volatile(i).unwrap();
         }
-        rx_ring.next_to_clean = i as u16;
+
+        devdata
+            .stats
+            .rx_bytes
+            .fetch_add(bytes_compl as u64, Ordering::Relaxed);
+        devdata
+            .stats
+            .rx_packets
+            .fetch_add(pkts_compl as u64, Ordering::Relaxed);
+
+        rx_ring.next_to_clean = i;
         pkts_compl
     }
 
     fn configure(
-        netdev: *mut bindings::net_device,
+        netdev: &net::Device,
         dev: &device::Device,
         re: &Resource,
-        tx_ring: &mut Ring,
-        rx_ring: &mut Ring,
+        tx_ring: &mut Ring<TxDesc>,
+        rx_ring: &mut Ring<RxDesc>,
     ) {
         E1000::set_rx_mode(netdev, re);
         E1000::configure_tx(re, tx_ring);
@@ -434,8 +402,8 @@ impl E1000 {
         E1000::alloc_rx_buffers(netdev, dev, re, rx_ring, cleaned_count);
     }
 
-    fn configure_tx(re: &Resource, tx_ring: &Ring) {
-        let tdba = tx_ring.dma_addr;
+    fn configure_tx(re: &Resource, tx_ring: &Ring<TxDesc>) {
+        let tdba = tx_ring.alloc.dma_handle;
         let tdlen = DEFAULT_TXD * core::mem::size_of::<TxDesc>();
         re.ew32(E1000_TDLEN, tdlen as u32);
         re.ew32(E1000_TDBAH, (tdba >> 32) as u32);
@@ -468,7 +436,7 @@ impl E1000 {
         re.ew32(E1000_TCTL, tctl);
     }
 
-    fn setup_rctl(netdev: *mut bindings::net_device, re: &Resource) {
+    fn setup_rctl(netdev: &net::Device, re: &Resource) {
         let mut rctl = re.er32(E1000_RCTL);
 
         rctl &= !(3 << E1000_RCTL_MO_SHIFT);
@@ -477,7 +445,7 @@ impl E1000 {
         //(hw->mc_filter_type << E1000_RCTL_MO_SHIFT);
 
         rctl &= !E1000_RCTL_SBP;
-        unsafe { assert!((*netdev).mtu <= bindings::ETH_DATA_LEN) }
+        assert!(netdev.mtu_get() <= bindings::ETH_DATA_LEN);
         rctl &= !E1000_RCTL_LPE;
 
         rctl &= !E1000_RCTL_SZ_4096;
@@ -486,48 +454,54 @@ impl E1000 {
         re.ew32(E1000_RCTL, rctl);
     }
 
-    fn unused_desc(ring: &Ring) -> u16 {
+    fn unused_desc(ring: &Ring<RxDesc>) -> usize {
         // reserve one
-        if ring.next_to_clean > ring.next_to_use {
-            ring.next_to_clean - ring.next_to_use - 1
+        let to_clean = ring.next_to_clean;
+        let to_use = ring.next_to_use;
+        if to_clean > to_use {
+            to_clean - to_use - 1
         } else {
-            DEFAULT_TXD as u16 + ring.next_to_clean - ring.next_to_use - 1
+            DEFAULT_TXD + to_clean - to_use - 1
         }
     }
 
     fn alloc_rx_buffers(
-        netdev: *mut bindings::net_device,
+        netdev: &net::Device,
         dev: &device::Device,
         re: &Resource,
-        ring: &mut Ring,
-        cleaned_count: u16,
+        ring: &mut Ring<RxDesc>,
+        cleaned_count: usize,
     ) {
         let len = RXBUFFER_2048;
-        let mut i = ring.next_to_use as usize;
+        let mut i = ring.next_to_use;
         for _ in 0..cleaned_count {
             let info = &mut ring.buffer_info[i];
             assert!(info.skb.is_none());
-            unsafe {
-                let skb = bindings::netdev_alloc_skb_ip_align(netdev, len);
-                let dma = dma::map_single(
-                    dev,
-                    (*skb).data as _,
-                    len as usize,
-                    bindings::dma_data_direction_DMA_FROM_DEVICE,
-                );
-                assert!(dma != !0);
-                let desc = ring.desc.add(i * core::mem::size_of::<RxDesc>()) as *mut RxDesc;
-                (*desc).buffer_addr = dma;
-                info.dma = dma;
-                info.skb.replace(skb);
-            }
+            let skb = netdev.alloc_skb_ip_align(len).unwrap();
+            let map = dma::MapSingle::try_new(
+                dev,
+                skb.head_data().as_ptr() as _,
+                len as usize,
+                bindings::dma_data_direction_DMA_FROM_DEVICE,
+            )
+            .unwrap();
+
+            let desc = RxDesc {
+                buffer_addr: map.dma_handle,
+                ..Default::default()
+            };
+            ring.alloc.write(i, &desc).unwrap();
+
+            info.map = Some(map);
+            info.skb.replace(skb);
+
             i += 1;
             if i == DEFAULT_TXD {
                 i = 0;
             }
         }
-        if i as u16 != ring.next_to_use {
-            ring.next_to_use = i as u16;
+        if i != ring.next_to_use {
+            ring.next_to_use = i;
             if i == 0 {
                 i = DEFAULT_TXD - 1;
             } else {
@@ -537,7 +511,7 @@ impl E1000 {
         }
     }
 
-    fn configure_rx(re: &Resource, rx_ring: &Ring) {
+    fn configure_rx(re: &Resource, rx_ring: &Ring<RxDesc>) {
         // adapter->clean_rx = e1000_clean_rx_irq;
         // adapter->alloc_rx_buf = e1000_alloc_rx_buffers;
 
@@ -551,7 +525,7 @@ impl E1000 {
         // adapter->itr = 3
         re.ew32(E1000_ITR, 1000000000 / (3 * 256));
 
-        let rdba = rx_ring.dma_addr;
+        let rdba = rx_ring.alloc.dma_handle;
         let rdlen = DEFAULT_TXD * core::mem::size_of::<RxDesc>();
         re.ew32(E1000_RDLEN, rdlen as u32);
         re.ew32(E1000_RDBAH, (rdba >> 32) as u32);
@@ -566,18 +540,17 @@ impl E1000 {
         re.ew32(E1000_RCTL, rctl | E1000_RCTL_EN);
     }
 
-    fn set_rx_mode(netdev: *mut bindings::net_device, re: &Resource) {
+    fn set_rx_mode(netdev: &net::Device, re: &Resource) {
         let mut rctl = re.er32(E1000_RCTL);
+        let flags = netdev.flags_get();
 
-        unsafe {
-            assert!((*netdev).flags & bindings::net_device_flags_IFF_PROMISC == 0);
-            assert!((*netdev).uc.count == 0);
+        assert!(flags & bindings::net_device_flags_IFF_PROMISC == 0);
+        //assert!((*netdev).uc.count == 0);
 
-            if (*netdev).flags & bindings::net_device_flags_IFF_ALLMULTI > 0 {
-                rctl |= E1000_RCTL_MPE;
-            } else {
-                rctl &= !E1000_RCTL_MPE;
-            }
+        if flags & bindings::net_device_flags_IFF_ALLMULTI > 0 {
+            rctl |= E1000_RCTL_MPE;
+        } else {
+            rctl &= !E1000_RCTL_MPE;
         }
 
         rctl &= !E1000_RCTL_UPE;
@@ -601,25 +574,25 @@ impl E1000 {
         re.write_flush();
     }
 
-    fn bar0_length(pdev: &pci::Device) -> usize {
-        for r in pdev.iter_resource() {
-            return r.len() as usize;
+    fn mmio(pdev: &pci::Device) -> Result<pci::MappedResource> {
+        for (i, r) in pdev.iter_resource().enumerate() {
+            if i == 0 {
+                return pdev.map_resource(&r, r.len());
+            }
         }
-        assert!(false);
-        0
+        Err(EINVAL)
     }
 
-    fn io_base(pdev: &pci::Device) -> u64 {
+    fn io_base(pdev: &pci::Device) -> Result<pci::IoPort> {
         for (i, r) in pdev.iter_resource().enumerate() {
             if i == 0 || r.len() == 0 {
                 continue;
             }
-            if r.flags & bindings::IORESOURCE_IO as u64 > 0 {
-                return r.start;
+            if r.check_flags(bindings::IORESOURCE_IO) {
+                return pci::IoPort::try_new(&r);
             }
         }
-        assert!(false);
-        0
+        Err(EINVAL)
     }
 
     fn init_eeprom_params(re: &Resource) -> EepromInfo {
@@ -654,7 +627,8 @@ impl E1000 {
         let mut i = 0;
         while eecd & E1000_EECD_GNT == 0 && i < E1000_EEPROM_GRANT_ATTEMPTS {
             i += 1;
-            unsafe { bindings::__const_udelay(5) }
+            delay::coarse_delay(Duration::from_micros(5));
+
             eecd = re.er32(E1000_EECD);
         }
 
@@ -669,7 +643,7 @@ impl E1000 {
         re.ew32(E1000_EECD, eecd);
 
         re.write_flush();
-        unsafe { bindings::__const_udelay(1) }
+        delay::coarse_delay(Duration::from_micros(1));
     }
 
     fn release_eeprom(re: &Resource, eeprom: &EepromInfo) {
@@ -683,17 +657,13 @@ impl E1000 {
         eecd |= E1000_EECD_SK;
         re.ew32(E1000_EECD, eecd);
         re.write_flush();
-        unsafe {
-            bindings::__udelay(eeprom.delay_usec.into());
-        }
+        delay::coarse_delay(Duration::from_micros(eeprom.delay_usec.into()));
 
         /* Falling edge of clock */
         eecd &= !E1000_EECD_SK;
         re.ew32(E1000_EECD, eecd);
         re.write_flush();
-        unsafe {
-            bindings::__udelay(eeprom.delay_usec.into());
-        }
+        delay::coarse_delay(Duration::from_micros(eeprom.delay_usec.into()));
 
         eecd &= !E1000_EECD_REQ;
         re.ew32(E1000_EECD, eecd);
@@ -706,9 +676,7 @@ impl E1000 {
         *eecd = *eecd | E1000_EECD_SK;
         re.ew32(E1000_EECD, *eecd);
         re.write_flush();
-        unsafe {
-            bindings::__udelay(eeprom.delay_usec.into());
-        }
+        delay::coarse_delay(Duration::from_micros(eeprom.delay_usec.into()));
     }
 
     fn lower_ee_clk(re: &Resource, eeprom: &EepromInfo, eecd: &mut u32) {
@@ -718,9 +686,7 @@ impl E1000 {
         *eecd = *eecd & !E1000_EECD_SK;
         re.ew32(E1000_EECD, *eecd);
         re.write_flush();
-        unsafe {
-            bindings::__udelay(eeprom.delay_usec.into());
-        }
+        delay::coarse_delay(Duration::from_micros(eeprom.delay_usec.into()));
     }
 
     fn shift_out_ee_bits(re: &Resource, eeprom: &EepromInfo, data: u16, count: u16) {
@@ -739,9 +705,7 @@ impl E1000 {
             let _ = re.ew32(E1000_EECD, eecd);
             re.write_flush();
 
-            unsafe {
-                bindings::__udelay(eeprom.delay_usec.into());
-            }
+            delay::coarse_delay(Duration::from_micros(eeprom.delay_usec.into()));
 
             E1000::raise_ee_clk(re, eeprom, &mut eecd);
             E1000::lower_ee_clk(re, eeprom, &mut eecd);
@@ -791,33 +755,25 @@ impl E1000 {
         eecd &= !(E1000_EECD_CS | E1000_EECD_SK);
         let _ = re.ew32(E1000_EECD, eecd);
         re.write_flush();
-        unsafe {
-            bindings::__udelay(eeprom.delay_usec.into());
-        }
+        delay::coarse_delay(Duration::from_micros(eeprom.delay_usec.into()));
 
         /* Clock high */
         eecd |= E1000_EECD_SK;
         let _ = re.ew32(E1000_EECD, eecd);
         re.write_flush();
-        unsafe {
-            bindings::__udelay(eeprom.delay_usec.into());
-        }
+        delay::coarse_delay(Duration::from_micros(eeprom.delay_usec.into()));
 
         /* Select EEPROM */
         eecd |= E1000_EECD_CS;
         let _ = re.ew32(E1000_EECD, eecd);
         re.write_flush();
-        unsafe {
-            bindings::__udelay(eeprom.delay_usec.into());
-        }
+        delay::coarse_delay(Duration::from_micros(eeprom.delay_usec.into()));
 
         /* Clock low */
         eecd &= !E1000_EECD_SK;
         let _ = re.ew32(E1000_EECD, eecd);
         re.write_flush();
-        unsafe {
-            bindings::__udelay(eeprom.delay_usec.into());
-        }
+        delay::coarse_delay(Duration::from_micros(eeprom.delay_usec.into()));
     }
 
     fn e1000_read_eeprom(re: &Resource, eeprom: &EepromInfo, offset: u16, words: u16) -> u16 {
@@ -842,9 +798,7 @@ impl E1000 {
              */
             data = E1000::shift_in_ee_bits(re, eeprom, 16);
             E1000::standby_eeprom(re, eeprom);
-            unsafe {
-                bindings::cond_resched();
-            }
+            sync::cond_resched();
         }
 
         E1000::release_eeprom(re, eeprom);
@@ -884,15 +838,11 @@ impl E1000 {
         re.ew32(E1000_TCTL, E1000_TCTL_PSP);
         re.write_flush();
 
-        unsafe {
-            bindings::msleep(10);
-        }
+        delay::coarse_sleep(Duration::from_millis(10));
         let ctrl = re.er32(E1000_CTRL);
 
         re.write_reg_io(E1000_CTRL, ctrl | E1000_CTRL_RST);
-        unsafe {
-            bindings::msleep(5);
-        }
+        delay::coarse_sleep(Duration::from_millis(5));
 
         let mut manc = re.er32(E1000_MANC);
         manc &= !E1000_MANC_ARP_EN;
@@ -921,17 +871,13 @@ impl E1000 {
     fn raise_mdi_clk(re: &Resource, ctrl: &mut u32) {
         re.ew32(E1000_CTRL, *ctrl | E1000_CTRL_MDC);
         re.write_flush();
-        unsafe {
-            bindings::__const_udelay(10);
-        }
+        delay::coarse_delay(Duration::from_micros(10));
     }
 
     fn lower_mdi_clk(re: &Resource, ctrl: &mut u32) {
         re.ew32(E1000_CTRL, *ctrl & !E1000_CTRL_MDC);
         re.write_flush();
-        unsafe {
-            bindings::__const_udelay(10);
-        }
+        delay::coarse_delay(Duration::from_micros(10));
     }
 
     fn shift_in_mdi_bits(re: &Resource) -> u16 {
@@ -978,9 +924,7 @@ impl E1000 {
 
             re.ew32(E1000_CTRL, ctrl);
             re.write_flush();
-            unsafe {
-                bindings::__const_udelay(10);
-            }
+            delay::coarse_delay(Duration::from_micros(10));
 
             E1000::raise_mdi_clk(re, &mut ctrl);
             E1000::lower_mdi_clk(re, &mut ctrl);
@@ -1001,9 +945,8 @@ impl E1000 {
         re.ew32(E1000_MDIC, mdic);
 
         for _ in 0..641 {
-            unsafe {
-                bindings::__const_udelay(5);
-            }
+            delay::coarse_delay(Duration::from_micros(5));
+
             mdic = re.er32(E1000_MDIC);
             if mdic & E1000_MDIC_READY > 0 {
                 break;
@@ -1085,7 +1028,7 @@ impl E1000 {
 }
 
 struct DrvData {
-    _dev: net::Device,
+    _reg: net::Registration<E1000>,
 }
 
 impl driver::DeviceRemoval for DrvData {
@@ -1100,22 +1043,18 @@ impl pci::Driver for E1000 {
     fn probe(pdev: &mut pci::Device, _id_info: Option<&Self::IdInfo>) -> Result<Self::Data> {
         pr_info!("intel e1000 probe");
 
-        let bars = pdev.select_bars(
-            bindings::IORESOURCE_MEM as core::ffi::c_ulong
-                | bindings::IORESOURCE_IO as core::ffi::c_ulong,
-        );
+        let bars = pdev.select_bars((bindings::IORESOURCE_MEM | bindings::IORESOURCE_IO) as u64);
         pdev.enable_device()?;
         pdev.request_selected_regions(bars, c_str!("e1000"))?;
         pdev.set_master();
 
-        let mmio = pdev.map_resource(0, E1000::bar0_length(pdev))?;
-        let io_base = E1000::io_base(pdev);
+        let mmio = E1000::mmio(pdev)?;
+        let port = E1000::io_base(pdev)?;
 
-        let re = Resource { mmio, io_base };
+        let re = Resource { mmio, port };
 
-        let mut ndev = net::Device::with_device(pdev, 1, 1)?;
-
-        // hw->mac_type = e1000_82540
+        let mut reg = net::Registration::<E1000>::try_new(pdev)?;
+        let ndev = reg.dev_get();
 
         dma::set_mask(pdev, 0xffffffff)?;
         dma::set_coherent_mask(pdev, 0xffffffff)?;
@@ -1126,16 +1065,10 @@ impl pci::Driver for E1000 {
         let eeprom = E1000::init_eeprom_params(&re);
         E1000::validate_eeprom_checksum(&re, &eeprom);
         let mac_addr = E1000::read_mac_addr(&re, &eeprom);
-        unsafe {
-            bindings::eth_hw_addr_set(ndev.0, &mac_addr as _);
-
-            (*ndev.0).min_mtu = bindings::ETH_MIN_MTU;
-            (*ndev.0).max_mtu = MAX_JUMBO_FRAME_SIZE - (bindings::ETH_HLEN + bindings::ETH_FCS_LEN);
-
-            (*ndev.0).priv_flags |= bindings::netdev_priv_flags_IFF_SUPP_NOFCS;
-
-            (*ndev.0).netdev_ops = DeviceOperationsVtable::<E1000>::build();
-        }
+        ndev.eth_hw_addr_set(&mac_addr);
+        ndev.min_mtu_set(bindings::ETH_MIN_MTU);
+        ndev.max_mtu_set(MAX_JUMBO_FRAME_SIZE - (bindings::ETH_HLEN + bindings::ETH_FCS_LEN));
+        ndev.priv_flags_set(ndev.priv_flags_get() | bindings::netdev_priv_flags_IFF_SUPP_NOFCS);
 
         E1000::reset(&re, &mac_addr);
 
@@ -1147,37 +1080,30 @@ impl pci::Driver for E1000 {
         assert_eq!(core::mem::size_of::<RxDesc>(), 16);
         assert_eq!(core::mem::size_of::<TxDesc>(), 16);
 
-        let mut napi = Pin::from(UniqueRef::try_new(Napi {
-            inner: UnsafeCell::new(bindings::napi_struct::default()),
-        })?);
-        unsafe {
-            bindings::netif_napi_add_weight(
-                ndev.0,
-                (*Pin::as_mut(&mut napi)).inner.get(),
-                Some(E1000::clean),
-                64,
-            );
-        }
+        let napi = net::NapiAdapter::<Poller>::add_weight(&ndev, 64)?;
+
+        ndev.netif_carrier_off();
+
+        let d = device::Device::from_dev(pdev);
+        let mut tx_ring =
+            unsafe { Pin::from(Box::try_new(SpinLock::new(Ring::new(&d, DEFAULT_TXD)))?) };
+        spinlock_init!(tx_ring.as_mut(), "e1000_tx_ring");
+        let mut rx_ring =
+            unsafe { Pin::from(Box::try_new(SpinLock::new(Ring::new(&d, DEFAULT_TXD)))?) };
+        spinlock_init!(rx_ring.as_mut(), "e1000_rx_ring");
 
         let devdata = Box::try_new(DevData {
-            dev: Ref::try_new(device::Device::from_dev(pdev))?,
-            _irq: None,
+            dev: Arc::try_new(d)?,
+            _irq: AtomicPtr::new(core::ptr::null_mut()),
             irqnum: pdev.irq(),
             napi: napi.into(),
-            tx_ring: None,
-            rx_ring: None,
-
-            re: Ref::try_new(re)?,
+            tx_ring,
+            rx_ring,
+            stats: Stats::new(),
+            re: Arc::try_new(re)?,
         })?;
 
-        unsafe {
-            bindings::dev_set_drvdata(
-                &mut (*ndev.0).dev,
-                Box::into_raw(devdata) as *const _ as *mut c_void,
-            );
-        }
-
-        ndev.register()?;
+        reg.register(devdata)?;
 
         pr_info!(
             "(PCI:33MHz:32-bit) {:x}:{:x}:{:x}:{:x}:{:x}:{:x}",
@@ -1190,11 +1116,7 @@ impl pci::Driver for E1000 {
         );
         pr_info!("Intel(R) PRO/1000 Network Connection");
 
-        unsafe {
-            bindings::netif_carrier_off(ndev.0);
-        }
-
-        Ok(Box::try_new(DrvData { _dev: ndev }).unwrap())
+        Ok(Box::try_new(DrvData { _reg: reg })?)
     }
 
     fn remove(_data: &Self::Data) {}
@@ -1217,8 +1139,8 @@ impl kernel::Module for E1000 {
 
 module! {
     type: E1000,
-    name: b"rust_e1000",
-    author: b"FUJITA Tomonori <fujita.tomonori@gmail.com>",
-    description: b"Rust toy e1000 driver",
-    license: b"GPL v2",
+    name: "rust_e1000",
+    author: "FUJITA Tomonori <fujita.tomonori@gmail.com>",
+    description: "Rust toy e1000 driver",
+    license: "GPL v2",
 }

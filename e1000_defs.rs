@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 // FIXME: handle endian
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -8,6 +10,7 @@ pub(crate) struct DescFlags {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub(crate) union TxLower {
     pub(crate) data: u32,
     pub(crate) flags: DescFlags,
@@ -22,12 +25,14 @@ pub(crate) struct DescFields {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub(crate) union TxUpper {
     pub(crate) data: u32,
     pub(crate) fields: DescFields,
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub(crate) struct TxDesc {
     pub(crate) buffer_addr: u64,
     pub(crate) lower: TxLower,
@@ -35,6 +40,7 @@ pub(crate) struct TxDesc {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Default)]
 pub(crate) struct RxDesc {
     pub(crate) buffer_addr: u64, /* Address of the descriptor's data buffer */
     pub(crate) length: u16,      /* Length of data DMAed into data buffer */
