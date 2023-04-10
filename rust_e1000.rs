@@ -950,10 +950,9 @@ impl E1000 {
             mdic = re.er32(E1000_MDIC);
             if mdic & E1000_MDIC_READY > 0 {
                 break;
-            }
-
-            assert!(mdic & E1000_MDIC_READY > 0);
+            }      
         }
+        assert!(mdic & E1000_MDIC_READY > 0);
     }
 
     fn read_phy_reg(re: &Resource, reg_addr: u32) -> u16 {
