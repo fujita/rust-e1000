@@ -10,3 +10,15 @@ $ make KDIR=~/git/linux LLVM=1
 ```
 
 This driver works on QEMU, howerver nothing else works.
+
+
+FYI, my command line is
+```text
+qemu-system-x86_64 -smp 2 -m 1G \
+  -kernel "arch/x86_64/boot/bzImage" \
+  -initrd ../../initrd.img \
+  -nographic -vga none \
+  -append console=ttyS0 \
+  -no-reboot -nic tap \
+  -virtfs local,path=/home/ubuntu/git/quinn,mount_tag=quinn,security_model=none
+```
