@@ -351,9 +351,9 @@ impl E1000 {
             let mut length = desc.length;
             let info = &mut rx_ring.buffer_info[i];
 
-            let _ = info.map.take();
+            let map_dma = info.map.take();
             let skb = info.skb.take().unwrap();
-
+            unsafe { bindings::dma_sync_single_for_cpu(devdata.dev.as_arc_borrow().ptr, map_dma.as_mut().unwrap().dma_handle, length as usize,bindings::dma_data_direction_DMA_FROM_DEVICE); }
             length -= 4;
             skb.put(length as u32);
             let protocol = skb.eth_type_trans(&napi.dev_get());
